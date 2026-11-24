@@ -2,46 +2,72 @@
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // শুধু localhost testing-এর জন্য
+header('Access-Control-Allow-Origin: *'); // Local testing
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
-
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(204);
-    exit;
-}
 
 function respond(int $status, array $data): void
 {
     http_response_code($status);
-    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+
+    echo json_encode(
+        $data,
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+    );
+
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    respond(405, ['success' => false, 'message' => 'POST method required']);
+$method = $_SERVER['REQUEST_METHOD'] ?? '';
+
+if ($method === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+if ($method !== 'POST') {
+    header('Allow: POST, OPTIONS');
+
+    respond(405, [
+        'success' => false,
+        'message' => 'POST method required',
+    ]);
 }
 
 $input = json_decode(file_get_contents('php://input'), true);
-$postId = filter_var($input['post_id'] ?? null, FILTER_VALIDATE_INT);
 
-if (!is_array($input) || !$postId || $postId < 1) {
-    respond(422, ['success' => false, 'message' => 'Valid post_id is required']);
+if (!is_array($input)) {
+    respond(400, [
+        'success' => false,
+        'message' => 'Valid JSON body required',
+    ]);
 }
 
-require_once __DIR__ . '/../../config/db.php';
-require_once __DIR__ . '/../../config/auth.php';
+$postId = filter_var(
+    $input['post_id'] ?? null,
+    FILTER_VALIDATE_INT
+);
+
+if (!$postId || $postId < 1) {
+    respond(422, [
+        'success' => false,
+        'message' => 'Valid post_id is required',
+    ]);
+}
 
 try {
+    require_once __DIR__ . '/../../config/db.php';
+    require_once __DIR__ . '/../../config/auth.php';
+
     $pdo = db();
     $user = requireAuth($pdo);
-    $userId = (int)$user['id'];
+    $userId = (int) $user['id'];
 
     $pdo->beginTransaction();
 
-    // Lock the post row so simultaneous taps cannot create duplicate likes.
+    // Post lock এবং visibility যাচাই।
     $postStmt = $pdo->prepare(
-        'SELECT p.id
+        'SELECT p.id, p.user_id
          FROM posts p
          INNER JOIN users author ON author.id = p.user_id
          WHERE p.id = :post_id
@@ -49,61 +75,127 @@ try {
            AND author.status NOT IN ("banned", "deleted")
            AND NOT EXISTS (
                SELECT 1 FROM user_blocks b
-               WHERE (b.blocker_id = :viewer1 AND b.blocked_id = author.id)
-                  OR (b.blocker_id = author.id AND b.blocked_id = :viewer2)
+               WHERE (
+                   b.blocker_id = :viewer1
+                   AND b.blocked_id = author.id
+               ) OR (
+                   b.blocker_id = author.id
+                   AND b.blocked_id = :viewer2
+               )
            )
          FOR UPDATE'
     );
 
     $postStmt->execute([
-        'post_id' => $postId,
+        'post_id' => (int) $postId,
         'viewer1' => $userId,
         'viewer2' => $userId,
     ]);
 
-    if (!$postStmt->fetch()) {
+    $post = $postStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$post) {
         $pdo->rollBack();
-        respond(404, ['success' => false, 'message' => 'Post not found']);
+
+        respond(404, [
+            'success' => false,
+            'message' => 'Post not found',
+        ]);
     }
 
+    $ownerId = (int) $post['user_id'];
+
     $check = $pdo->prepare(
-        'SELECT 1 FROM post_likes WHERE post_id = :post_id AND user_id = :user_id'
+        'SELECT 1
+         FROM post_likes
+         WHERE post_id = :post_id
+           AND user_id = :user_id'
     );
+
     $check->execute([
-        'post_id' => $postId,
+        'post_id' => (int) $postId,
         'user_id' => $userId,
     ]);
 
-    if ($check->fetchColumn()) {
-        $change = $pdo->prepare(
-            'DELETE FROM post_likes WHERE post_id = :post_id AND user_id = :user_id'
+    $alreadyLiked = (bool) $check->fetchColumn();
+
+    // এই actor ও post-এর আগের like notification পরিষ্কার।
+    // এতে unlike এবং পুনরায় like—দুটিতেই duplicate হবে না।
+    $clear = $pdo->prepare(
+        'DELETE FROM notifications
+         WHERE user_id = :owner_id
+           AND actor_id = :actor_id
+           AND post_id = :post_id
+           AND type = "like"
+           AND comment_id IS NULL'
+    );
+
+    $clear->execute([
+        'owner_id' => $ownerId,
+        'actor_id' => $userId,
+        'post_id' => (int) $postId,
+    ]);
+
+    if ($alreadyLiked) {
+        $delete = $pdo->prepare(
+            'DELETE FROM post_likes
+             WHERE post_id = :post_id
+               AND user_id = :user_id'
         );
-        $change->execute([
-            'post_id' => $postId,
+
+        $delete->execute([
+            'post_id' => (int) $postId,
             'user_id' => $userId,
         ]);
+
         $isLiked = false;
     } else {
-        $change = $pdo->prepare(
-            'INSERT INTO post_likes (post_id, user_id) VALUES (:post_id, :user_id)'
+        $insert = $pdo->prepare(
+            'INSERT INTO post_likes (post_id, user_id)
+             VALUES (:post_id, :user_id)'
         );
-        $change->execute([
-            'post_id' => $postId,
+
+        $insert->execute([
+            'post_id' => (int) $postId,
             'user_id' => $userId,
         ]);
+
+        if ($ownerId !== $userId) {
+            $notify = $pdo->prepare(
+                'INSERT INTO notifications (
+                    user_id, actor_id, type, post_id
+                 ) VALUES (
+                    :user_id, :actor_id, "like", :post_id
+                 )'
+            );
+
+            $notify->execute([
+                'user_id' => $ownerId,
+                'actor_id' => $userId,
+                'post_id' => (int) $postId,
+            ]);
+        }
+
         $isLiked = true;
     }
 
-    $countStmt = $pdo->prepare(
-        'SELECT COUNT(*) FROM post_likes WHERE post_id = :post_id'
+    $count = $pdo->prepare(
+        'SELECT COUNT(*)
+         FROM post_likes
+         WHERE post_id = :post_id'
     );
-    $countStmt->execute(['post_id' => $postId]);
-    $likesCount = (int)$countStmt->fetchColumn();
+
+    $count->execute([
+        'post_id' => (int) $postId,
+    ]);
+
+    $likesCount = (int) $count->fetchColumn();
 
     $pdo->commit();
 
     respond(200, [
         'success' => true,
+        'post_id' => (int) $postId,
         'is_liked' => $isLiked,
         'likes_count' => $likesCount,
     ]);
@@ -112,5 +204,8 @@ try {
         $pdo->rollBack();
     }
 
-    respond(500, ['success' => false, 'message' => 'Could not update like']);
+    respond(500, [
+        'success' => false,
+        'message' => 'Could not update like',
+    ]);
 }
