@@ -2,19 +2,18 @@
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // Local testing
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Cache-Control: no-store');
 
 function respond(int $status, array $data): void
 {
     http_response_code($status);
-
     echo json_encode(
         $data,
         JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
     );
-
     exit;
 }
 
@@ -27,7 +26,6 @@ if ($method === 'OPTIONS') {
 
 if ($method !== 'GET') {
     header('Allow: GET, OPTIONS');
-
     respond(405, [
         'success' => false,
         'message' => 'GET method required',
@@ -88,11 +86,20 @@ $offset = ($page - 1) * $limit;
 
 try {
     require_once __DIR__ . '/../../config/db.php';
-    require_once __DIR__ . '/../../config/auth.php';
+    require_once __DIR__ . '/../../config/optional_auth.php';
 
     $pdo = db();
-    $viewer = requireAuth($pdo);
-    $viewerId = (int) $viewer['id'];
+    $viewer = optionalAuth($pdo);
+    $viewerId = $viewer !== null ? (int) $viewer['id'] : 0;
+    $isGuest = $viewer === null;
+
+    if ($type === 'following' && $isGuest) {
+        respond(401, [
+            'success' => false,
+            'message' => 'Login required to view your following feed',
+            'login_required' => true,
+        ]);
+    }
 
     $where = [
         'p.status = "active"',
@@ -121,7 +128,6 @@ try {
     ];
 
     if ($type === 'following') {
-        // Following feed-এ নিজের post-ও থাকবে।
         $where[] = '(
             p.user_id = :own_user_id
             OR EXISTS (
@@ -196,9 +202,7 @@ try {
 
          FROM posts p
          INNER JOIN users u ON u.id = p.user_id
-
          WHERE ' . implode(' AND ', $where) . '
-
          ORDER BY p.created_at DESC, p.id DESC
          LIMIT :fetch_limit OFFSET :offset'
     );
@@ -207,7 +211,6 @@ try {
         $stmt->bindValue($key, $value, PDO::PARAM_INT);
     }
 
-    // Category অবশ্যই string হিসেবে bind করতে হবে।
     if ($category !== '') {
         $stmt->bindValue(':category', $category, PDO::PARAM_STR);
     }
@@ -232,14 +235,17 @@ try {
             $post[$field] = (int) $post[$field];
         }
 
-        $post['is_liked'] = (bool) $post['is_liked'];
-        $post['is_following'] = (bool) $post['is_following'];
-        $post['is_owner'] = $post['author_id'] === $viewerId;
+        $post['is_liked'] = !$isGuest && (bool) $post['is_liked'];
+        $post['is_following'] =
+            !$isGuest && (bool) $post['is_following'];
+        $post['is_owner'] =
+            !$isGuest && $post['author_id'] === $viewerId;
     }
     unset($post);
 
     respond(200, [
         'success' => true,
+        'is_guest' => $isGuest,
         'type' => $type,
         'category' => $category === '' ? null : $category,
         'posts' => $posts,

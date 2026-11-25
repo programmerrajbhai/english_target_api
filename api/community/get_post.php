@@ -2,9 +2,10 @@
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // Local testing
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Cache-Control: no-store');
 
 function respond(int $status, array $data): void
 {
@@ -42,11 +43,12 @@ if (!$postId || $postId < 1) {
 
 try {
     require_once __DIR__ . '/../../config/db.php';
-    require_once __DIR__ . '/../../config/auth.php';
+    require_once __DIR__ . '/../../config/optional_auth.php';
 
     $pdo = db();
-    $viewer = requireAuth($pdo);
-    $viewerId = (int) $viewer['id'];
+    $viewer = optionalAuth($pdo);
+    $viewerId = $viewer !== null ? (int) $viewer['id'] : 0;
+    $isGuest = $viewer === null;
 
     $stmt = $pdo->prepare(
         'SELECT
@@ -156,12 +158,15 @@ try {
         $post[$field] = (int) $post[$field];
     }
 
-    $post['is_liked'] = (bool) $post['is_liked'];
-    $post['is_following'] = (bool) $post['is_following'];
-    $post['is_owner'] = $post['author_id'] === $viewerId;
+    $post['is_liked'] = !$isGuest && (bool) $post['is_liked'];
+    $post['is_following'] =
+        !$isGuest && (bool) $post['is_following'];
+    $post['is_owner'] =
+        !$isGuest && $post['author_id'] === $viewerId;
 
     respond(200, [
         'success' => true,
+        'is_guest' => $isGuest,
         'post' => $post,
     ]);
 } catch (Throwable $e) {

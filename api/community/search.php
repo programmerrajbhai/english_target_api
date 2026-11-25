@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // Local testing
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
@@ -18,6 +18,93 @@ function respond(int $status, array $data): void
     exit;
 }
 
+/**
+ * প্রতিটি search word অন্তত একটি নির্ধারিত field-এ মিলতে হবে।
+ * Column expressions শুধু নিচের fixed code থেকে আসে।
+ */
+function searchCondition(
+    array $columns,
+    array $words,
+    string $prefix,
+    array &$params
+): string {
+    $groups = [];
+
+    foreach ($words as $wordIndex => $word) {
+        $escaped = str_replace(
+            ['!', '%', '_'],
+            ['!!', '!%', '!_'],
+            $word
+        );
+
+        $matches = [];
+
+        foreach ($columns as $columnIndex => $column) {
+            $key = ':' . $prefix . '_' . $wordIndex . '_' . $columnIndex;
+
+            $matches[] = "
+                CONVERT(COALESCE($column, '') USING utf8mb4)
+                COLLATE utf8mb4_unicode_ci
+                LIKE $key ESCAPE '!'
+            ";
+
+            $params[$key] = '%' . $escaped . '%';
+        }
+
+        $groups[] = '(' . implode(' OR ', $matches) . ')';
+    }
+
+    return '(' . implode(' AND ', $groups) . ')';
+}
+
+/**
+ * Banned/deleted এবং দুই দিকের blocked users বাদ।
+ */
+function visibleUser(
+    string $alias,
+    string $prefix,
+    int $viewerId,
+    array &$params
+): string {
+    $viewer1 = ':' . $prefix . '_viewer1';
+    $viewer2 = ':' . $prefix . '_viewer2';
+
+    $params[$viewer1] = $viewerId;
+    $params[$viewer2] = $viewerId;
+
+    return "
+        $alias.status NOT IN ('banned', 'deleted')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM user_blocks b
+            WHERE (
+                b.blocker_id = $viewer1
+                AND b.blocked_id = $alias.id
+            ) OR (
+                b.blocker_id = $alias.id
+                AND b.blocked_id = $viewer2
+            )
+        )
+    ";
+}
+
+function fetchRows(PDO $pdo, string $sql, array $params): array
+{
+    $stmt = $pdo->prepare($sql);
+
+    foreach ($params as $key => $value) {
+        $stmt->bindValue(
+            $key,
+            $value,
+            is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR
+        );
+    }
+
+    $stmt->execute();
+
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
 $method = $_SERVER['REQUEST_METHOD'] ?? '';
 
 if ($method === 'OPTIONS') {
@@ -27,6 +114,7 @@ if ($method === 'OPTIONS') {
 
 if ($method !== 'GET') {
     header('Allow: GET, OPTIONS');
+
     respond(405, [
         'success' => false,
         'message' => 'GET method required',
@@ -37,16 +125,31 @@ $query = $_GET['q'] ?? '';
 $type = $_GET['type'] ?? 'all';
 $category = $_GET['category'] ?? '';
 
-if (!is_string($query)) {
+if (
+    !is_string($query) ||
+    !is_string($type) ||
+    !is_string($category)
+) {
     respond(422, [
         'success' => false,
-        'message' => 'q must be text',
+        'message' => 'Invalid search parameters',
     ]);
 }
 
-$query = trim($query);
+$normalized = preg_replace('/\s+/u', ' ', $query);
 
-if (mb_strlen($query) < 2 || mb_strlen($query) > 80) {
+if ($normalized === null) {
+    respond(422, [
+        'success' => false,
+        'message' => 'Invalid search text encoding',
+    ]);
+}
+
+$query = trim($normalized);
+$category = trim($category);
+
+if (mb_strlen($query, 'UTF-8') < 2 ||
+    mb_strlen($query, 'UTF-8') > 80) {
     respond(422, [
         'success' => false,
         'message' => 'Search text must be 2–80 characters',
@@ -56,18 +159,9 @@ if (mb_strlen($query) < 2 || mb_strlen($query) > 80) {
 if (!in_array($type, ['all', 'people', 'posts', 'questions'], true)) {
     respond(422, [
         'success' => false,
-        'message' => 'type must be all, people, posts, or questions',
+        'message' => 'Invalid search type',
     ]);
 }
-
-if (!is_string($category)) {
-    respond(422, [
-        'success' => false,
-        'message' => 'Invalid category',
-    ]);
-}
-
-$category = trim($category);
 
 if (!in_array(
     $category,
@@ -105,14 +199,7 @@ if ($limit === false || $limit < 1 || $limit > 20) {
 }
 
 $offset = ($page - 1) * $limit;
-
-$escapedQuery = str_replace(
-    ['!', '%', '_'],
-    ['!!', '!%', '!_'],
-    $query
-);
-
-$searchQuery = '%' . $escapedQuery . '%';
+$words = array_values(array_unique(explode(' ', $query)));
 
 try {
     require_once __DIR__ . '/../../config/db.php';
@@ -128,8 +215,31 @@ try {
     $hasMorePosts = false;
 
     if ($type === 'all' || $type === 'people') {
-        $stmt = $pdo->prepare(
-            'SELECT
+        $params = [
+            ':following_viewer' => $viewerId,
+            ':follower_viewer' => $viewerId,
+            ':fetch_limit' => $limit + 1,
+            ':offset' => $offset,
+        ];
+
+        $match = searchCondition(
+            ['u.name', 'u.bio'],
+            $words,
+            'people_search',
+            $params
+        );
+
+        $visible = visibleUser(
+            'u',
+            'people_visibility',
+            $viewerId,
+            $params
+        );
+
+        $people = fetchRows(
+            $pdo,
+            "
+            SELECT
                 u.id,
                 u.name,
                 u.bio,
@@ -142,7 +252,7 @@ try {
                     INNER JOIN users follower
                         ON follower.id = f.follower_id
                     WHERE f.following_id = u.id
-                      AND follower.status NOT IN ("banned", "deleted")
+                      AND follower.status NOT IN ('banned', 'deleted')
                 ) AS followers_count,
 
                 EXISTS (
@@ -157,42 +267,17 @@ try {
                       AND f.following_id = :follower_viewer
                 ) AS follows_you
 
-             FROM users u
-             WHERE u.name LIKE :search_query ESCAPE "!"
-               AND u.id <> :viewer_id
-               AND u.status NOT IN ("banned", "deleted")
-               AND NOT EXISTS (
-                   SELECT 1 FROM user_blocks b
-                   WHERE (
-                       b.blocker_id = :viewer1
-                       AND b.blocked_id = u.id
-                   ) OR (
-                       b.blocker_id = u.id
-                       AND b.blocked_id = :viewer2
-                   )
-               )
-             ORDER BY u.name ASC, u.id ASC
-             LIMIT :fetch_limit OFFSET :offset'
+            FROM users u
+
+            WHERE $match
+              AND $visible
+
+            ORDER BY u.name ASC, u.id ASC
+            LIMIT :fetch_limit OFFSET :offset
+            ",
+            $params
         );
 
-        $params = [
-            ':following_viewer' => $viewerId,
-            ':follower_viewer' => $viewerId,
-            ':viewer_id' => $viewerId,
-            ':viewer1' => $viewerId,
-            ':viewer2' => $viewerId,
-            ':fetch_limit' => $limit + 1,
-            ':offset' => $offset,
-        ];
-
-        foreach ($params as $key => $value) {
-            $stmt->bindValue($key, $value, PDO::PARAM_INT);
-        }
-
-        $stmt->bindValue(':search_query', $searchQuery, PDO::PARAM_STR);
-        $stmt->execute();
-
-        $people = $stmt->fetchAll(PDO::FETCH_ASSOC);
         $hasMorePeople = count($people) > $limit;
 
         if ($hasMorePeople) {
@@ -200,11 +285,18 @@ try {
         }
 
         foreach ($people as &$person) {
-            $person['id'] = (int) $person['id'];
-            $person['level'] = (int) $person['level'];
-            $person['followers_count'] = (int) $person['followers_count'];
-            $person['is_following'] = (bool) $person['is_following'];
-            $person['follows_you'] = (bool) $person['follows_you'];
+            foreach (['id', 'level', 'followers_count'] as $field) {
+                $person[$field] = (int) $person[$field];
+            }
+
+            $person['is_self'] = $person['id'] === $viewerId;
+
+            $person['is_following'] =
+                !$person['is_self'] && (bool) $person['is_following'];
+
+            $person['follows_you'] =
+                !$person['is_self'] && (bool) $person['follows_you'];
+
             $person['is_mutual'] =
                 $person['is_following'] && $person['follows_you'];
         }
@@ -212,12 +304,51 @@ try {
     }
 
     if (in_array($type, ['all', 'posts', 'questions'], true)) {
-        $categoryCondition = $category === ''
-            ? ''
-            : ' AND p.category = :category';
+        $params = [
+            ':liked_viewer' => $viewerId,
+            ':following_viewer' => $viewerId,
+            ':fetch_limit' => $limit + 1,
+            ':offset' => $offset,
+        ];
 
-        $stmt = $pdo->prepare(
-            'SELECT
+        $match = searchCondition(
+            [
+                'p.body',
+                'p.english_sentence',
+                'p.bangla_meaning',
+                'u.name',
+                "REPLACE(p.category, '_', ' ')",
+            ],
+            $words,
+            'post_search',
+            $params
+        );
+
+        $visible = visibleUser(
+            'u',
+            'post_visibility',
+            $viewerId,
+            $params
+        );
+
+        $commentVisible = visibleUser(
+            'cu',
+            'comment_visibility',
+            $viewerId,
+            $params
+        );
+
+        $categoryCondition = '';
+
+        if ($category !== '') {
+            $categoryCondition = ' AND p.category = :category';
+            $params[':category'] = $category;
+        }
+
+        $posts = fetchRows(
+            $pdo,
+            "
+            SELECT
                 p.id,
                 p.category,
                 p.post_type,
@@ -244,18 +375,8 @@ try {
                     FROM comments c
                     INNER JOIN users cu ON cu.id = c.user_id
                     WHERE c.post_id = p.id
-                      AND c.status = "active"
-                      AND cu.status NOT IN ("banned", "deleted")
-                      AND NOT EXISTS (
-                          SELECT 1 FROM user_blocks cb
-                          WHERE (
-                              cb.blocker_id = :comment_viewer1
-                              AND cb.blocked_id = cu.id
-                          ) OR (
-                              cb.blocker_id = cu.id
-                              AND cb.blocked_id = :comment_viewer2
-                          )
-                      )
+                      AND c.status = 'active'
+                      AND $commentVisible
                 ) AS comments_count,
 
                 EXISTS (
@@ -270,58 +391,20 @@ try {
                       AND f.following_id = u.id
                 ) AS is_following
 
-             FROM posts p
-             INNER JOIN users u ON u.id = p.user_id
+            FROM posts p
+            INNER JOIN users u ON u.id = p.user_id
 
-             WHERE (
-                 p.body LIKE :body_query ESCAPE "!"
-                 OR p.english_sentence LIKE :english_query ESCAPE "!"
-                 OR p.bangla_meaning LIKE :bangla_query ESCAPE "!"
-             )
-               AND p.status = "active"
-               AND u.status NOT IN ("banned", "deleted")
-               AND NOT EXISTS (
-                   SELECT 1 FROM user_blocks b
-                   WHERE (
-                       b.blocker_id = :viewer1
-                       AND b.blocked_id = u.id
-                   ) OR (
-                       b.blocker_id = u.id
-                       AND b.blocked_id = :viewer2
-                   )
-               )
-               ' . $categoryCondition . '
+            WHERE p.status = 'active'
+              AND $visible
+              AND $match
+              $categoryCondition
 
-             ORDER BY p.created_at DESC, p.id DESC
-             LIMIT :fetch_limit OFFSET :offset'
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT :fetch_limit OFFSET :offset
+            ",
+            $params
         );
 
-        $params = [
-            ':liked_viewer' => $viewerId,
-            ':following_viewer' => $viewerId,
-            ':viewer1' => $viewerId,
-            ':viewer2' => $viewerId,
-            ':comment_viewer1' => $viewerId,
-            ':comment_viewer2' => $viewerId,
-            ':fetch_limit' => $limit + 1,
-            ':offset' => $offset,
-        ];
-
-        foreach ($params as $key => $value) {
-            $stmt->bindValue($key, $value, PDO::PARAM_INT);
-        }
-
-        foreach ([':body_query', ':english_query', ':bangla_query'] as $key) {
-            $stmt->bindValue($key, $searchQuery, PDO::PARAM_STR);
-        }
-
-        if ($category !== '') {
-            $stmt->bindValue(':category', $category, PDO::PARAM_STR);
-        }
-
-        $stmt->execute();
-
-        $posts = $stmt->fetchAll(PDO::FETCH_ASSOC);
         $hasMorePosts = count($posts) > $limit;
 
         if ($hasMorePosts) {
@@ -361,8 +444,11 @@ try {
         ],
     ]);
 } catch (Throwable $e) {
+    // Details শুধু server log-এ থাকবে।
+    error_log('Community search failed: ' . $e->getMessage());
+
     respond(500, [
         'success' => false,
-        'message' => 'Search failed',
+        'message' => 'Search failed. Check server error log.',
     ]);
 }

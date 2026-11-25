@@ -2,19 +2,18 @@
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // Local testing
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Cache-Control: no-store');
 
 function respond(int $status, array $data): void
 {
     http_response_code($status);
-
     echo json_encode(
         $data,
         JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
     );
-
     exit;
 }
 
@@ -27,18 +26,13 @@ if ($method === 'OPTIONS') {
 
 if ($method !== 'GET') {
     header('Allow: GET, OPTIONS');
-
     respond(405, [
         'success' => false,
         'message' => 'GET method required',
     ]);
 }
 
-$postId = filter_input(
-    INPUT_GET,
-    'post_id',
-    FILTER_VALIDATE_INT
-);
+$postId = filter_input(INPUT_GET, 'post_id', FILTER_VALIDATE_INT);
 
 if (!$postId || $postId < 1) {
     respond(422, [
@@ -71,13 +65,13 @@ $offset = ($page - 1) * $limit;
 
 try {
     require_once __DIR__ . '/../../config/db.php';
-    require_once __DIR__ . '/../../config/auth.php';
+    require_once __DIR__ . '/../../config/optional_auth.php';
 
     $pdo = db();
-    $viewer = requireAuth($pdo);
-    $viewerId = (int) $viewer['id'];
+    $viewer = optionalAuth($pdo);
+    $viewerId = $viewer !== null ? (int) $viewer['id'] : 0;
+    $isGuest = $viewer === null;
 
-    // Post active ও viewer-এর জন্য visible হতে হবে।
     $postStmt = $pdo->prepare(
         'SELECT p.id
          FROM posts p
@@ -86,8 +80,7 @@ try {
            AND p.status = "active"
            AND author.status NOT IN ("banned", "deleted")
            AND NOT EXISTS (
-               SELECT 1
-               FROM user_blocks b
+               SELECT 1 FROM user_blocks b
                WHERE (
                    b.blocker_id = :viewer1
                    AND b.blocked_id = author.id
@@ -136,8 +129,7 @@ try {
             ) AS likes_count,
 
             EXISTS (
-                SELECT 1
-                FROM comment_likes cl
+                SELECT 1 FROM comment_likes cl
                 WHERE cl.comment_id = c.id
                   AND cl.user_id = :liked_viewer
             ) AS is_liked
@@ -149,8 +141,7 @@ try {
            AND c.status = "active"
            AND u.status NOT IN ("banned", "deleted")
            AND NOT EXISTS (
-               SELECT 1
-               FROM user_blocks b
+               SELECT 1 FROM user_blocks b
                WHERE (
                    b.blocker_id = :viewer1
                    AND b.blocked_id = u.id
@@ -201,13 +192,16 @@ try {
             ? null
             : (int) $comment['parent_id'];
 
-        $comment['is_liked'] = (bool) $comment['is_liked'];
-        $comment['is_owner'] = $comment['user_id'] === $viewerId;
+        $comment['is_liked'] =
+            !$isGuest && (bool) $comment['is_liked'];
+        $comment['is_owner'] =
+            !$isGuest && $comment['user_id'] === $viewerId;
     }
     unset($comment);
 
     respond(200, [
         'success' => true,
+        'is_guest' => $isGuest,
         'comments' => $comments,
         'pagination' => [
             'page' => $page,
